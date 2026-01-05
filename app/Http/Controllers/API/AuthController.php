@@ -4,6 +4,7 @@ namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
+use App\Models\RefreshToken;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Validation\ValidationException;
@@ -42,11 +43,20 @@ class AuthController extends Controller
         // Optional: revoke old tokens (single session)
         $user->tokens()->delete();
 
-        $token = $user->createToken(
-            'api-token', // name
-            ['*'], // abilities
-            now()->addMinutes(10) // expires_at
+        $accessToken = $user->createToken(
+            'access-token',
+            ['*'],
+            now()->addMinutes(10)
         );
+
+        $refreshTokenPlain = \Str::random(64);
+
+        $refreshToken =  RefreshToken::create([
+            'user_id' => $user->id,
+            'token_hash' => hash('sha256', $refreshTokenPlain),
+            'expires_at' => now()->addDays(7),
+        ]);
+
 
         return response()->json([
             'success' => true,
@@ -57,8 +67,10 @@ class AuthController extends Controller
                     'name' => $user->name,
                     'email' => $user->email,
                 ],
-                'access_token' => $token->plainTextToken,
-                'expires_at' => $token->accessToken->expires_at->format('Y-m-d H:i:s'),
+                'access_token' => $accessToken->plainTextToken,
+                'access_expires_at' => $accessToken->accessToken->expires_at->format('Y-m-d H:i:s'),
+                'refresh_token' => $refreshTokenPlain,
+                'refresh_expires_at' => $refreshToken->expires_at->format('Y-m-d H:i:s')
             ],
         ]);
     }
@@ -97,11 +109,63 @@ class AuthController extends Controller
      */
     public function logout(Request $request)
     {
-        $request->user()->currentAccessToken()->delete();
+        $user = $request->user();
+
+        // 1️⃣ revoke access token yang sedang dipakai
+        $user->currentAccessToken()?->delete();
+
+        // 2️⃣ revoke refresh token PASANGAN
+        if ($request->refresh_token) {
+            RefreshToken::where('token_hash', hash('sha256', $request->refresh_token))
+                ->update(['revoked_at' => now()]);
+        }
 
         return response()->json([
             'success' => true,
             'message' => 'Logged out',
         ]);
     }
+
+    public function refresh(Request $request)
+    {
+        $refreshTokenPlain = $request->bearerToken();
+
+        $refreshToken = RefreshToken::where('token_hash', hash('sha256', $refreshTokenPlain))
+            ->whereNull('revoked_at')
+            ->where('expires_at', '>', now())
+            ->first();
+
+        if (!$refreshToken) {
+            return response()->json([
+                'message' => 'Invalid refresh token'
+            ], 401);
+        }
+
+        $user = $refreshToken->user;
+
+        // ROTATION
+        $refreshToken->update(['revoked_at' => now()]);
+
+        $newAccessToken = $user->createToken(
+            'access-token',
+            ['*'],
+            now()->addMinutes(10)
+        );
+
+        $newRefreshPlain = \Str::random(64);
+
+        $refreshToken = RefreshToken::create([
+            'user_id' => $user->id,
+            'token_hash' => hash('sha256', $newRefreshPlain),
+            'expires_at' => now()->addDays(7),
+        ]);
+
+        return response()->json([
+            'access_token' => $newAccessToken->plainTextToken,
+            'access_expires_at' => $newAccessToken->accessToken->expires_at->format('Y-m-d H:i:s'),
+            'refresh_token' => $newRefreshPlain,
+            'refresh_expires_at' => $refreshToken->expires_at->format('Y-m-d H:i:s')
+        ]);
+    }
+
 }
